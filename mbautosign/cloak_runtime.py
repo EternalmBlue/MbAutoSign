@@ -212,6 +212,9 @@ def download(asset: Asset, path: Path, log: RunLog) -> None:
 
 
 def extract(archive: Path, destination: Path, *, is_zip: bool) -> None:
+    # Compare resolved paths on both sides, including when a parent is a junction.
+    destination = destination.resolve(strict=True)
+
     def target(name: str) -> Path:
         parts = name.rstrip("/").split("/")
         if any(part in {"", ".."} or "\\" in part or ":" in part for part in parts):

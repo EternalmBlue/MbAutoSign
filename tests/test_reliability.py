@@ -237,7 +237,7 @@ class ReliabilityTests(unittest.TestCase):
             first = cloak.resolve_cloak(self.log, cache=cache, home_cache=other_browser.parent.parent)
             second = cloak.resolve_cloak(self.log, cache=cache, home_cache=other_browser.parent.parent)
             self.assertEqual(first, second)
-            self.assertTrue(first.is_relative_to(cache / "linux-x64"))
+            self.assertEqual(first, (incomplete / "chrome").resolve())
             self.assertEqual(fetch.call_count, 2)
             failure = next(call.kwargs for call in self.log.event.call_args_list
                            if call.args[0] == "cloak_download_source_failed")
@@ -313,7 +313,9 @@ class ReliabilityTests(unittest.TestCase):
         with zipfile.ZipFile(archive, "w") as bundle:
             bundle.writestr("chrome-win64/chrome.exe", "fixture")
             bundle.writestr("chrome-win64/locales/en-US.pak", "fixture resource")
-        staging = self.root / "staging"
+        intermediate = self.root / "intermediate"
+        intermediate.mkdir()
+        staging = intermediate / ".." / "staging"
         staging.mkdir()
         cloak.extract(archive, staging, is_zip=True)
         exe = staging / "chrome-win64" / "chrome.exe"
