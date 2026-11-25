@@ -1,3 +1,5 @@
+debug = false # true: detailed diagnostic logs; false: short messages.
+
 [schedule]
 enable = true # false: sign in once; true: keep running on the daily schedule.
 time = "00:05"
@@ -9,7 +11,8 @@ retry_delay_seconds = 300
 [browser]
 profile = ".cloak-profile"
 headless = true
-timeout_ms = 20000
+timeout_ms = 20000 # Page navigation and operations.
+launch_timeout_ms = 90000 # Opening the persistent browser profile.
 challenge_wait_seconds = 10 # Passive wait in modes that restore login; 0 disables it.
 
 [login]

@@ -105,6 +105,28 @@ class ReliabilityTests(unittest.TestCase):
         self.assertTrue(cfg.enabled)
         self.assertFalse(hasattr(cfg, "executable"))
 
+    def test_debug_is_opt_in_and_requires_a_boolean(self):
+        path = self.root / "config.toml"
+        defaults = (ROOT / "packaging" / "config.toml").read_text(encoding="utf-8")
+        path.write_text(defaults.split("\n", 1)[1], encoding="utf-8")
+        self.assertFalse(load_settings(path).debug)
+        path.write_text(defaults.replace("debug = false", "debug = true", 1), encoding="utf-8")
+        self.assertTrue(load_settings(path).debug)
+        path.write_text(defaults.replace("debug = false", 'debug = "true"', 1), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "debug"):
+            load_settings(path)
+
+    def test_old_page_timeout_is_preserved_without_shortening_browser_launch(self):
+        path = self.root / "config.toml"
+        defaults = (ROOT / "packaging" / "config.toml").read_text(encoding="utf-8")
+        old = "\n".join(line for line in defaults.splitlines() if not line.startswith("launch_timeout_ms"))
+        path.write_text(old, encoding="utf-8")
+        cfg = load_settings(path)
+        self.assertEqual((cfg.timeout_ms, cfg.launch_timeout_ms), (20000, 90000))
+        path.write_text(old.replace("timeout_ms = 20000", "timeout_ms = 120000"), encoding="utf-8")
+        cfg = load_settings(path)
+        self.assertEqual((cfg.timeout_ms, cfg.launch_timeout_ms), (120000, 120000))
+
     def test_scheduler_moves_to_next_day_after_exception_and_does_not_retry(self):
         cfg = config(self.root)
         clock = iter(datetime(2026, 1, day, hour, tzinfo=cfg.timezone) for day, hour in
@@ -120,10 +142,43 @@ class ReliabilityTests(unittest.TestCase):
 
         with patch.object(scheduler, "POLL_SECONDS", 0):
             scheduler.daily_loop(cfg, self.log, stopping, now=lambda: next(clock), worker=worker,
-                                 claims=self.root / "days")
+                                 completions=self.root / "schedule")
         self.assertEqual(attempted, ["2026-01-01", "2026-01-02"])
-        self.assertFalse(scheduler.claim_day(self.root / "days", "2026-01-01"))
+        self.assertFalse(list((self.root / "schedule").glob("*.done")))
         self.assertEqual(self.log.exception.call_args.args[0], "schedule_iteration_failed")
+
+    def test_restart_ignores_legacy_dispatch_marker_and_skips_only_confirmed_day(self):
+        cfg = config(self.root)
+        directory = self.root / "schedule"
+        day = "2026-01-01"
+        now = datetime(2026, 1, 1, 9, tzinfo=cfg.timezone)
+        scheduler.claim_day(directory, day)  # Older versions wrote this before launching the worker.
+        attempts = []
+
+        def fail(_cfg, _log, stop, attempt_day):
+            attempts.append(attempt_day)
+            stop.set()
+            return 1
+
+        for _ in range(2):
+            scheduler.daily_loop(cfg, self.log, Event(), now=lambda: now, worker=fail, completions=directory)
+            self.assertFalse(scheduler.completion_file(directory, day).exists())
+        self.assertEqual(attempts, [day, day])
+
+        scheduler.mark_completed(directory, day)
+        stopped = Event()
+        moments = iter([now, None])
+
+        def final_clock():
+            moment = next(moments)
+            if moment is None:
+                stopped.set()
+            return moment or now
+
+        with patch.object(scheduler, "POLL_SECONDS", 0):
+            scheduler.daily_loop(cfg, self.log, stopped, now=final_clock, worker=fail, completions=directory)
+        self.assertEqual(attempts, [day, day])
+        self.log.event.assert_called_with("schedule_day_already_completed", day=day)
 
     def test_timed_out_process_is_reaped_and_a_later_worker_runs(self):
         cfg = config(self.root, job_timeout_seconds=2)
@@ -179,7 +234,7 @@ class ReliabilityTests(unittest.TestCase):
 
         with patch.object(scheduler, "POLL_SECONDS", 0):
             scheduler.daily_loop(cfg, self.log, stop, now=now, elapsed=lambda: ticks,
-                                 worker=worker, claims=self.root / "schedule")
+                                 worker=worker, completions=self.root / "schedule")
         self.assertEqual(attempts, [("2026-01-01", 0), ("2026-01-01", 15),
                                     ("2026-01-01", 30), ("2026-01-02", 0)])
         self.assertIn("schedule_retry_exhausted", [call.args[0] for call in self.log.event.call_args_list])
@@ -214,7 +269,7 @@ class ReliabilityTests(unittest.TestCase):
 
                 with patch.object(scheduler, "POLL_SECONDS", 0):
                     scheduler.daily_loop(cfg, log, stop, now=now, elapsed=lambda: next(elapsed),
-                                         worker=worker, claims=logs / "schedule")
+                                         worker=worker, completions=logs / "schedule")
                 self.assertEqual(attempts, ["2026-01-01", "2026-01-02"])
                 event = "schedule_retry_skipped" if reserved else "schedule_retry_expired"
                 self.assertIn(event, [call.args[0] for call in log.event.call_args_list])
@@ -287,13 +342,15 @@ class ReliabilityTests(unittest.TestCase):
         archive = self.root / "fixture.tar"
         payload = b"verified fixture"
         asset = cloak.Asset("146.0.7680.177.5", archive.name, len(payload), hashlib.sha256(payload).hexdigest())
-        log = runlog.RunLog("test", path=self.root / "events.jsonl")
-        with (patch.object(cloak, "DOWNLOAD_TIMEOUT_SECONDS", 5),
+        log = runlog.RunLog("test", path=self.root / "events.jsonl", debug=True)
+        # Cold process startup can exceed a few seconds on Windows. Allow time for the
+        # fixture to write its PID, while still requiring cleanup before its 60-second sleep ends.
+        with (patch.object(cloak, "DOWNLOAD_TIMEOUT_SECONDS", 20),
               patch.object(cloak, "transfer_worker", stalled_then_healthy_source),
               patch.object(runlog, "emit_console")):
             started = monotonic()
             cloak.download(asset, archive, log)
-        self.assertLess(monotonic() - started, 7)
+        self.assertLess(monotonic() - started, 25)
         self.assertEqual(archive.read_bytes(), payload)
         pid = int(archive.with_suffix(".pid").read_text(encoding="ascii"))
         self.assertFalse(psutil.pid_exists(pid))
@@ -326,7 +383,7 @@ class ReliabilityTests(unittest.TestCase):
 
     def test_log_rotates_and_records_safe_location_instead_of_exception_text(self):
         log_path = self.root / "events.jsonl"
-        log = runlog.RunLog("test", path=log_path)
+        log = runlog.RunLog("test", path=log_path, debug=True)
         with patch.object(runlog, "LOG_MAX_BYTES", 500), patch.object(runlog, "emit_console"):
             log.event("first", fixture_padding="x" * 380)
             try:
@@ -338,6 +395,23 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(old["event"], "first")
         self.assertEqual(json.loads(current)["error_type"], "ValueError")
         self.assertNotIn("fixture secret", current)
+
+    def test_normal_and_debug_logs_use_separate_formats(self):
+        plain_path, debug_path = self.root / "checkins.log", self.root / "checkins.jsonl"
+        with (patch.object(runlog, "LOG_PATH", plain_path), patch.object(runlog, "DEBUG_LOG_PATH", debug_path),
+              patch.object(runlog, "emit_console") as output):
+            for debug in (False, True):
+                log = runlog.RunLog("single", debug=debug)
+                log.event("phase_started", phase="launch_browser")
+                log.event("run_finished", result="signed", post_count=1)
+        lines = plain_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("签到成功", lines[0])
+        self.assertNotIn("post_count", lines[0])
+        self.assertEqual(output.call_args_list[0].args, (lines[0],))
+        rows = [json.loads(line) for line in debug_path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([row["event"] for row in rows], ["phase_started", "run_finished"])
+        self.assertEqual(rows[-1]["post_count"], 1)
 
     def test_checkin_uses_all_enabled_currency_fields_in_both_guards(self):
         page = Mock()
@@ -401,8 +475,10 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_expected_redirect_verifies_once_and_cross_site_redirect_is_not_followed(self):
-        for status, location, outcome in [(303, "/", "signed"), (307, "https://example.invalid/", "unexpected_post_response")]:
-            with self.subTest(status=status):
+        cases = [(303, "/", "signed_in", "signed"), (303, "/", "unknown", "confirmation_missing"),
+                 (307, "https://example.invalid/", "signed_in", "unexpected_post_response")]
+        for status, location, session, outcome in cases:
+            with self.subTest(status=status, session=session):
                 cfg = config(self.root)
                 flow = signin.CheckFlow(self.log)
                 page, cdp = Mock(), Mock()
@@ -419,7 +495,8 @@ class ReliabilityTests(unittest.TestCase):
 
                 page.locator.return_value.evaluate.side_effect = fetch
                 with (patch.object(signin, "claim_day", return_value=True),
-                      patch.object(signin, "inspect_home", return_value={"home_status": 200, "result": "already_signed"}) as verify):
+                      patch.object(signin, "inspect_home", return_value={"home_status": 200,
+                                   "result": "already_signed", "session_state": session}) as verify):
                     result = signin.submit_checkin(page, cdp, cfg, flow, {"session_state": "signed_in"})
                 self.assertEqual(result["result"], outcome)
                 self.assertEqual(result["post_count"], 1)
@@ -431,13 +508,69 @@ class ReliabilityTests(unittest.TestCase):
         context = Mock(pages=[Mock()])
         blocked = {"home_status": 468, "session_state": "unknown", "result": "security_check", "post_count": 0}
         recovered = {"home_status": 200, "session_state": "signed_in", "result": "already_signed", "post_count": 0}
-        with (patch.object(signin, "browser_session", return_value=nullcontext(context)),
+        with (patch.object(signin, "LOG_DIR", self.root),
+              patch.object(signin, "browser_session", return_value=nullcontext(context)),
               patch.object(signin, "inspect_home", side_effect=[blocked.copy(), recovered.copy()]),
               patch.object(signin, "restore_login", return_value={"login_result": "already_logged_in"}) as login):
             self.assertEqual(signin.run_once(cfg, log=self.log), 0)
             login.assert_called_once()
             self.assertEqual(login.call_args.kwargs["challenge_wait_ms"], 10000)
             self.assertEqual(self.log.event.call_args.kwargs["post_count"], 0)
+
+    def test_completion_records_only_verified_result_for_the_current_day(self):
+        cfg = config(self.root)
+        day = datetime.now(cfg.timezone).date().isoformat()
+        cases = [
+            ("ready", "signed_in", "signed", day, True, 0),
+            ("already_signed", "signed_in", None, day, True, 0),
+            ("already_signed", "unknown", None, day, False, 1),
+            ("ready", "signed_in", "confirmation_missing", day, False, 1),
+            ("ready", "signed_in", "attempt_already_reserved", day, False, 1),
+            ("already_signed", "signed_in", None, "2020-01-01", False, 0),
+        ]
+        for index, (state, session, submission, scheduled_day, completed, exit_code) in enumerate(cases):
+            with self.subTest(state=state, session=session, submission=submission, day=scheduled_day):
+                logs = self.root / str(index)
+                home = {"result": state, "session_state": session, "home_status": 200, "post_count": 0}
+                context = Mock(pages=[Mock()])
+                with (patch.object(signin, "LOG_DIR", logs),
+                      patch.object(signin, "browser_session", return_value=nullcontext(context)),
+                      patch.object(signin, "inspect_home", return_value=home),
+                      patch.object(signin, "submit_checkin", return_value={"result": submission}) as submit):
+                    self.assertEqual(signin.run_once(cfg, log=self.log, scheduled_day=scheduled_day), exit_code)
+                    self.assertEqual(submit.call_count, int(state == "ready"))
+                self.assertEqual([path.name for path in (logs / "schedule").glob("*.done")],
+                                 [f"{day}.done"] if completed else [])
+
+    def test_only_confirmed_browser_launch_timeout_can_retry_before_navigation(self):
+        defaults = (ROOT / "packaging" / "config.toml").read_text(encoding="utf-8")
+        path = self.root / "config.toml"
+        path.write_text(defaults.replace("launch_timeout_ms = 90000", "launch_timeout_ms = 105000"),
+                        encoding="utf-8")
+        cfg = load_settings(path)
+        for exc, result, retry in (
+            (BrowserTimeout("fixture launch timed out"), "browser_launch_timeout", True),
+            (BrowserError("user data directory is already in use"), "profile_in_use", False),
+            (BrowserError("browser process failed"), "run_failed", False),
+        ):
+            with self.subTest(result=result):
+                driver = Mock()
+                launch = driver.chromium.launch_persistent_context
+                launch.side_effect = exc
+                with (patch.object(signin, "resolve_cloak", return_value=self.root / "fixture-cloak"),
+                      patch.object(signin, "sync_playwright", return_value=nullcontext(driver)),
+                      patch.object(signin, "inspect_home") as home, patch.object(signin, "restore_login") as login,
+                      patch.object(signin, "claim_day") as reserve):
+                    code = signin.run_once(cfg, log=self.log, scheduled_day="2026-01-01")
+                    self.assertEqual(code, scheduler.RETRY_EXIT if retry else 1)
+                    home.assert_not_called()
+                    login.assert_not_called()
+                    reserve.assert_not_called()
+                self.assertEqual(launch.call_args.kwargs["timeout"], 105000)
+                row = self.log.event.call_args.kwargs
+                self.assertEqual(row["result"], result)
+                self.assertEqual(row["post_count"], 0)
+                self.assertIs(row.get("retryable", False), retry)
 
     def test_home_outages_have_safe_diagnostics_without_login_or_submission(self):
         cfg = config(self.root)
@@ -454,7 +587,7 @@ class ReliabilityTests(unittest.TestCase):
         ]
         for status, error, outcome, network, retry in cases:
             with self.subTest(status=status, network=network):
-                log = runlog.RunLog("test", path=self.root / "events.jsonl")
+                log = runlog.RunLog("test", path=self.root / "events.jsonl", debug=True)
                 page = Mock()
                 page.goto.return_value.status = status
                 page.goto.side_effect = error

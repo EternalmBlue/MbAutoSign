@@ -35,6 +35,22 @@ def claim_day(directory: Path, day: str) -> bool:
     return True
 
 
+def completion_file(directory: Path, day: str) -> Path:
+    # Older .lock files marked dispatch, not confirmed completion.
+    return directory / f"{day}.done"
+
+
+def mark_completed(directory: Path, day: str) -> None:
+    marker = completion_file(directory, day)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with marker.open("xb"):
+            pass
+    except FileExistsError:
+        if not marker.is_file():
+            raise
+
+
 def stop_worker(worker: subprocess.Popen, log: RunLog, job_id: str) -> None:
     descendants = []
     cleanup_failed = False
@@ -122,7 +138,7 @@ def run_worker(config: Settings, log: RunLog, stopping: Event, day: str, *,
 
 
 def daily_loop(config: Settings, log: RunLog, stopping: Event, *, now=None, worker=None,
-               elapsed=monotonic, claims: Path = LOG_DIR / "schedule") -> None:
+               elapsed=monotonic, completions: Path = LOG_DIR / "schedule") -> None:
     now = now or (lambda: datetime.now(config.timezone))
     worker = worker or run_worker
     last_day = None
@@ -139,18 +155,19 @@ def daily_loop(config: Settings, log: RunLog, stopping: Event, *, now=None, work
                     pending = None
                 elif elapsed() >= retry_at:
                     pending = None
-                    if (claims.with_name("attempts") / f"{day}.lock").exists():
+                    if completion_file(completions, day).is_file():
+                        log.event("schedule_day_already_completed", day=day)
+                    elif (completions.with_name("attempts") / f"{day}.lock").exists():
                         log.event("schedule_retry_skipped", day=day, reason="checkin_already_reserved")
                     else:
                         attempt = next_attempt
             if day != last_day and current.time() >= config.scheduled_time:
-                allowed = claim_day(claims, day)
                 last_day = day
-                if allowed:
+                if completion_file(completions, day).is_file():
+                    log.event("schedule_day_already_completed", day=day)
+                else:
                     log.event("schedule_due", day=day)
                     attempt = 1
-                else:
-                    log.event("schedule_day_already_claimed", day=day)
             if attempt is not None and not stopping.is_set():
                 if attempt > 1:
                     log.event("schedule_retry_started", day=day, attempt=attempt)
@@ -168,7 +185,7 @@ def daily_loop(config: Settings, log: RunLog, stopping: Event, *, now=None, work
 
 
 def watch(config: Settings) -> int:
-    log = RunLog("watch", config.timezone)
+    log = RunLog("watch", config.timezone, debug=config.debug)
     if not config.enabled:
         log.event("schedule_disabled")
         return 0

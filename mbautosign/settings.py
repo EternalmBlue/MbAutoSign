@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
 LOG_DIR = ROOT / "logs"
+DEFAULT_LAUNCH_TIMEOUT_MS = 90_000
 
 
 class ConfigError(ValueError):
@@ -31,6 +32,8 @@ class Settings:
     job_timeout_seconds: int = 600
     retry_count: int = 2
     retry_delay_seconds: int = 300
+    launch_timeout_ms: int = DEFAULT_LAUNCH_TIMEOUT_MS
+    debug: bool = False
 
 
 def load_settings(path: Path = ROOT / "config.toml") -> Settings:
@@ -61,6 +64,10 @@ def load_settings(path: Path = ROOT / "config.toml") -> Settings:
             raise ConfigError(f"{keys[id(section)]}.{name} 必须在 {low} 到 {high} 之间。")
         return value
 
+    debug = config.get("debug", False)
+    if type(debug) is not bool:
+        raise ConfigError("debug 必须是 true 或 false。")
+
     if "enable" in schedule:
         enabled = get(schedule, "enable", bool)
         if "enabled" in schedule and get(schedule, "enabled", bool) != enabled:
@@ -82,10 +89,11 @@ def load_settings(path: Path = ROOT / "config.toml") -> Settings:
     profile = (path.parent / Path(profile_name).expanduser()).resolve()
     if profile in {profile.parent, path.parent.resolve(), Path.home().resolve()}:
         raise ConfigError("browser.profile 不能是根目录、项目目录或用户主目录。")
+    timeout_ms = bounded(browser, "timeout_ms", 20000, 100, 180000)
     return Settings(
         profile=profile,
         headless=get(browser, "headless", bool),
-        timeout_ms=bounded(browser, "timeout_ms", 20000, 100, 180000),
+        timeout_ms=timeout_ms,
         enabled=enabled,
         scheduled_time=time.fromisoformat(launch_at),
         timezone=timezone,
@@ -95,4 +103,6 @@ def load_settings(path: Path = ROOT / "config.toml") -> Settings:
         job_timeout_seconds=bounded(schedule, "job_timeout_seconds", 600, 1, 7200),
         retry_count=bounded(schedule, "retry_count", 2, 0, 5),
         retry_delay_seconds=bounded(schedule, "retry_delay_seconds", 300, 15, 3600),
+        launch_timeout_ms=bounded(browser, "launch_timeout_ms", max(timeout_ms, DEFAULT_LAUNCH_TIMEOUT_MS), 100, 180000),
+        debug=debug,
     )

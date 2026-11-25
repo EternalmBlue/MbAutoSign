@@ -15,13 +15,14 @@ from playwright.sync_api import CDPSession, Error as BrowserError, Page, Route, 
 from .cloak_runtime import CloakDownloadUnavailable, CloakError, resolve_cloak
 from .minebbs_login import HOME, home_network_failure, restore_login, session_state, transient_home_status
 from .runlog import RunLog
-from .scheduler import RUN_DAY_ENV, RUN_ID_ENV, RETRY_EXIT, claim_day, watch
+from .scheduler import RUN_DAY_ENV, RUN_ID_ENV, RETRY_EXIT, claim_day, mark_completed, watch
 from .settings import LOG_DIR, ConfigError, Settings, load_settings
 
 
 CLOCK = urljoin(HOME, "/credits/clock")
 FORM = ".mjc-signin-status form.mjc-signin-form"
-OK = {"signed", "already_signed", "attempt_already_reserved", "scheduled_day_expired"}
+CONFIRMED = {"signed", "already_signed"}
+OK = CONFIRMED | {"scheduled_day_expired"}
 CHECKIN_PAYLOAD_JS = """
         function readCheckinPayload(form) {
             const fields = [...form.elements].filter(x => x.type === 'hidden' && !x.matches(':disabled'));
@@ -179,8 +180,9 @@ def submit_checkin(page: Page, cdp: CDPSession, config: Settings, flow: CheckFlo
         details.pop("retryable", None)
         flow.log.exception("checkin_verification_failed", exc, post_count=flow.posts, **details)
         return {**result, "result": "confirmation_missing"}
+    confirmed = verified["result"] == "already_signed" and verified["session_state"] == "signed_in"
     return {**result, "verify_status": verified["home_status"],
-            "result": "signed" if verified["result"] == "already_signed" else "confirmation_missing"}
+            "result": "signed" if confirmed else "confirmation_missing"}
 
 
 @contextmanager
@@ -191,7 +193,8 @@ def browser_session(config: Settings, flow: CheckFlow):
     initialized = (config.profile / "Local State").is_file()
     config.profile.mkdir(parents=True, exist_ok=True)
     with FileLock(config.profile / ".mbautosign.lock", timeout=0), managed_playwright(flow) as playwright:
-        flow.stage("launch_browser", headless=config.headless, profile_initialized=initialized)
+        flow.stage("launch_browser", headless=config.headless, profile_initialized=initialized,
+                   launch_timeout_ms=config.launch_timeout_ms)
         browser_env = dict(os.environ)
         if sys.platform.startswith("linux") and getattr(sys, "frozen", False):
             if original := browser_env.pop("LD_LIBRARY_PATH_ORIG", None):
@@ -200,7 +203,7 @@ def browser_session(config: Settings, flow: CheckFlow):
                 browser_env.pop("LD_LIBRARY_PATH", None)
         context = playwright.chromium.launch_persistent_context(
             user_data_dir=config.profile, executable_path=executable, headless=config.headless,
-            service_workers="block", timeout=config.timeout_ms, env=browser_env,
+            service_workers="block", timeout=config.launch_timeout_ms, env=browser_env,
         )
         flow.log.event("browser_opened", headless=config.headless)
         try:
@@ -234,6 +237,8 @@ def failure(flow: CheckFlow, exc: Exception) -> dict:
         outcome = "cloak_unavailable"
     elif flow.phase == "start_playwright":
         outcome = "playwright_driver_failed"
+    elif flow.phase == "launch_browser" and isinstance(exc, BrowserTimeout):
+        outcome = "browser_launch_timeout"
     elif network:
         outcome = "operation_timed_out" if network["network_error"] == "timeout" else "homepage_unreachable"
     elif isinstance(exc, (BrowserTimeout, TimeoutError, LockTimeout)):
@@ -244,7 +249,7 @@ def failure(flow: CheckFlow, exc: Exception) -> dict:
                **network}
     if isinstance(exc, CloakError):
         details["cloak_error"] = str(exc)  # All CloakError messages are fixed local diagnostics.
-    if isinstance(exc, CloakDownloadUnavailable):
+    if isinstance(exc, CloakDownloadUnavailable) or outcome == "browser_launch_timeout":
         details["retryable"] = True
     if flow.phase == "launch_browser" and isinstance(exc, BrowserError):
         if library := re.search(r"shared libraries: (lib[A-Za-z0-9_.+-]{1,80})", str(exc)):
@@ -266,6 +271,7 @@ def emit_result(flow: CheckFlow, result: dict) -> int:
 def run_once(config: Settings, *, log: RunLog,
              scheduled_day: str | None = None) -> int:
     flow = CheckFlow(log, scheduled_day=scheduled_day)
+    run_day = scheduled_day or datetime.now(config.timezone).date().isoformat()
     log.event("run_started")
     result = None
     login_details = {}
@@ -300,7 +306,19 @@ def run_once(config: Settings, *, log: RunLog,
                         login_details["login_result"] = home["result"] = status
                 else:
                     home["result"] = login_details["login_result"]
+            if home["result"] == "already_signed" and home["session_state"] != "signed_in":
+                home["result"] = "session_not_confirmed"
             result = submit_checkin(page, cdp, config, flow, home) if home["result"] == "ready" else home
+            if result["result"] in CONFIRMED:
+                if datetime.now(config.timezone).date().isoformat() != run_day:
+                    log.event("schedule_completion_day_changed", day=run_day, level="warning")
+                else:
+                    try:
+                        mark_completed(LOG_DIR / "schedule", run_day)
+                    except OSError as exc:
+                        log.exception("schedule_completion_write_failed", exc, day=run_day)
+                    else:
+                        log.event("schedule_day_completed", day=run_day)
     except Exception as exc:
         if result is None:
             result = failure(flow, exc)
@@ -324,6 +342,7 @@ def main() -> int:
                       action="请在程序所在目录创建并填写 config.toml，然后重试。")
             return 2
         log.tz = config.timezone
+        log.debug = config.debug
         if config.enabled and not scheduled:
             return watch(config)
         if scheduled and not config.enabled:

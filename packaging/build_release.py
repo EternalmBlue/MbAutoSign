@@ -55,15 +55,16 @@ def smoke(command: list[str], root: Path, scratch: Path) -> None:
            "HTTPS_PROXY": proxy, "https_proxy": proxy, "HTTP_PROXY": proxy, "http_proxy": proxy,
            "NO_PROXY": "", "no_proxy": "", "MBAUTOSIGN_JOB_ID": "", "MBAUTOSIGN_JOB_DAY": ""}
     log = root / "logs" / "checkins.jsonl"
+    plain_log = root / "logs" / "checkins.log"
 
-    def run(expected: int) -> list[dict]:
+    def run(expected: int, path: Path) -> tuple[str, str]:
         result = subprocess.run(command, cwd=scratch, env=env, timeout=90, capture_output=True)
-        if result.returncode != expected or not log.is_file():
+        if result.returncode != expected or not path.is_file():
             raise RuntimeError(f"Smoke test expected exit {expected}, got {result.returncode}: "
                                f"{result.stdout!r}\n{result.stderr!r}")
-        rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-        log.unlink()
-        return rows
+        contents = path.read_text(encoding="utf-8")
+        path.unlink()
+        return contents, result.stdout.decode("utf-8")
 
     def verify_scheduler() -> None:
         with (scratch / "scheduler-output.txt").open("wb") as console:
@@ -79,6 +80,7 @@ def smoke(command: list[str], root: Path, scratch: Path) -> None:
                             assert finished["exit_code"] == 75, rows
                             assert any(row["event"] == "run_finished" and row["run_id"] == finished["job_id"]
                                        and row["result"] == "cloak_unavailable" for row in rows)
+                            assert not list((root / "logs" / "schedule").glob("*.done"))
                             return
                     sleep(0.1)
                 raise RuntimeError("Frozen scheduler did not launch and finish its worker")
@@ -112,19 +114,27 @@ def smoke(command: list[str], root: Path, scratch: Path) -> None:
         raise RuntimeError("The release config must contain blank login credentials")
     schedule = defaults["schedule"]
     assert schedule["enable"] is True and schedule["time"] == "00:05" and schedule["timezone"] == "Asia/Shanghai"
+    assert defaults["debug"] is False
     try:
         config.unlink()
-        rows = run(2)
-        assert rows[-1]["event"] == "configuration_file_missing" and "config.toml" in rows[-1]["action"]
+        summary, console = run(2, plain_log)
+        assert "找不到 config.toml" in summary and "找不到 config.toml" in console
         assert not config.exists()
 
-        config.write_text(text.replace("enable = true", "enable = false", 1), encoding="utf-8", newline="")
-        rows = run(1)
+        single = text.replace("enable = true", "enable = false", 1)
+        config.write_text(single, encoding="utf-8", newline="")
+        summary, console = run(1, plain_log)
+        assert "无法准备 Cloak Browser" in summary and "无法准备 Cloak Browser" in console
+        assert "phase_started" not in summary and not log.exists()
+        config.write_text(single.replace("debug = false", "debug = true", 1), encoding="utf-8", newline="")
+        diagnostic, _ = run(1, log)
+        rows = [json.loads(line) for line in diagnostic.splitlines()]
         failures = [row["source"] for row in rows if row["event"] == "cloak_download_source_failed"]
         assert failures == ["official", "github"], rows
         assert rows[-1]["result"] == "cloak_unavailable" and rows[-1]["post_count"] == 0
         assert not list((root / ".cloak-bin").glob("*/.download-*"))
-        config.write_text(text.replace('time = "00:05"', 'time = "00:00"', 1), encoding="utf-8", newline="")
+        scheduled = text.replace('time = "00:05"', 'time = "00:00"', 1).replace("debug = false", "debug = true", 1)
+        config.write_text(scheduled, encoding="utf-8", newline="")
         verify_scheduler()
     finally:
         config.write_bytes(original)
@@ -147,6 +157,7 @@ def build(output: Path) -> None:
         subprocess.run([
             sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--noupx",
             "--onefile", "--name", name,
+            *(["--icon", str(PACKAGING / "MbAutoSign.ico")] if windows else []),
             "--collect-all", "playwright", "--collect-data", "tzdata",
             "--distpath", str(target), "--workpath", str(work / "build"), "--specpath", str(work),
             str(ROOT / "signin.py"),

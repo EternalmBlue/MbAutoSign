@@ -83,6 +83,8 @@ jobs:
 
           Edit the included `config.toml` next to the executable. Login fields are blank, and the daily schedule defaults to 00:05 China Standard Time (`Asia/Shanghai`). If upgrading, keep your existing `config.toml` and update its schedule if desired.
 
+          The default log shows short Chinese messages. Set `debug = true` at the top of the config for detailed JSON logs. A day counts as complete only after MineBBS confirms the check-in.
+
           Python and its dependencies are included. Cloak Browser is downloaded from CloakHQ when no supported local copy is available.
           NOTES
           gh release create "$RELEASE_TAG" ./* --repo "$GITHUB_REPOSITORY" --verify-tag \
