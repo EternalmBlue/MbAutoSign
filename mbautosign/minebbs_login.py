@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from urllib.parse import urlsplit
 
 from playwright.sync_api import BrowserContext, Error as BrowserError, Page, Response, Route, TimeoutError
@@ -11,6 +12,33 @@ HOME = "https://www.minebbs.com/"
 LOGIN_LINK = 'a.p-navgroup-link--logIn[data-xf-click="overlay"]'
 LOGIN_FORM = '.overlay form:has(input[name="login"]):has(input[name="password"][type="password"])'
 CHALLENGE = '#slg-box, [data-sitekey], iframe[src*="captcha"], iframe[src*="challenges.cloudflare.com"]'
+NETWORK_ERRORS = {
+    "offline": {"ERR_INTERNET_DISCONNECTED", "ERR_NETWORK_CHANGED", "ERR_ADDRESS_UNREACHABLE"},
+    "dns": {"ERR_NAME_NOT_RESOLVED", "ERR_NAME_RESOLUTION_FAILED", "ERR_DNS_TIMED_OUT"},
+    "connection": {"ERR_CONNECTION_REFUSED", "ERR_CONNECTION_RESET", "ERR_CONNECTION_CLOSED",
+                   "ERR_CONNECTION_ABORTED", "ERR_CONNECTION_FAILED", "ERR_EMPTY_RESPONSE",
+                   "ERR_PROXY_CONNECTION_FAILED", "ERR_TUNNEL_CONNECTION_FAILED"},
+    "timeout": {"ERR_TIMED_OUT", "ERR_CONNECTION_TIMED_OUT"},
+    "tls": {"ERR_CERT_AUTHORITY_INVALID", "ERR_CERT_DATE_INVALID", "ERR_CERT_COMMON_NAME_INVALID",
+            "ERR_CERT_INVALID", "ERR_SSL_PROTOCOL_ERROR", "ERR_SSL_VERSION_OR_CIPHER_MISMATCH"},
+}
+
+
+def transient_home_status(status: int | None) -> bool:
+    return status is not None and (status in {408, 429} or 500 <= status <= 599)
+
+
+def home_network_failure(exc: Exception) -> dict:
+    if isinstance(exc, TimeoutError):
+        return {"network_error": "timeout", "retryable": True}
+    if isinstance(exc, BrowserError):
+        match = re.search(r"\bnet::(ERR_[A-Z0-9_]+)\b", str(exc))
+        if match:
+            code = match[1]
+            for category, codes in NETWORK_ERRORS.items():
+                if code in codes:
+                    return {"network_error": category, "network_code": code, "retryable": category != "tls"}
+    return {}
 
 
 def session_state(page: Page) -> str:
@@ -50,7 +78,12 @@ def navigate_home(page: Page, challenge_wait_ms: int = 0, *, log: RunLog | None 
     try:
         response = page.goto(HOME, wait_until="domcontentloaded")
         initial_status = response.status if response else None
-        state = "security_check" if initial_status == 468 else session_state(page)
+        if initial_status == 468:
+            state = "security_check"
+        elif transient_home_status(initial_status):
+            state = "homepage_failed"
+        else:
+            state = session_state(page)
         if state == "security_check" and challenge_wait_ms:
             # The site may navigate to the same URL; a URL change alone cannot signal completion.
             if log:
@@ -123,7 +156,8 @@ def restore_login(context: BrowserContext, username: str, password: str, timeout
         if log:
             log.event("login_home_checked", home_status=home_status, initial_status=initial_status, session_state=state)
         if home_status != 200:
-            return result("security_check" if state == "security_check" else "homepage_failed")
+            return result("security_check" if state == "security_check" else "homepage_failed",
+                          retryable=transient_home_status(home_status))
         if state == "signed_in":
             return result("already_logged_in")
         if state != "signed_out":
@@ -189,13 +223,16 @@ def restore_login(context: BrowserContext, username: str, password: str, timeout
             return result("login_rejected", login_http_status=login_response.status)
         return result("submitted", login_http_status=login_response.status)
     except TimeoutError as exc:
+        details = home_network_failure(exc) if phase == "login_home" else {}
         if log:
-            log.exception("login_timed_out", exc, phase=phase, login_post_count=attempts)
-        return result("login_outcome_unknown" if attempts else "login_ui_not_ready")
+            log.exception("login_timed_out", exc, phase=phase, login_post_count=attempts, **details)
+        return result("login_outcome_unknown" if attempts else "login_ui_not_ready", **details)
     except Exception as exc:
+        details = home_network_failure(exc) if phase == "login_home" else {}
         if log:
-            log.exception("login_failed", exc, phase=phase, login_post_count=attempts)
-        return result("login_outcome_unknown" if attempts else "login_failed")
+            log.exception("login_failed", exc, phase=phase, login_post_count=attempts, **details)
+        return result("login_outcome_unknown" if attempts else "homepage_unreachable" if details else "login_failed",
+                      **details)
     finally:
         armed = False
         try:

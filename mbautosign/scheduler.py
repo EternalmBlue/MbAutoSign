@@ -18,6 +18,9 @@ from .settings import LOG_DIR, ROOT, Settings
 
 
 RUN_ID_ENV = "MBAUTOSIGN_JOB_ID"
+RUN_DAY_ENV = "MBAUTOSIGN_JOB_DAY"
+# The child opts in only on a known transient failure before any POST could have occurred.
+RETRY_EXIT = 75
 POLL_SECONDS = 15
 
 
@@ -88,12 +91,14 @@ def stop_worker(worker: subprocess.Popen, log: RunLog, job_id: str) -> None:
 
 
 def run_worker(config: Settings, log: RunLog, stopping: Event, day: str, *,
-               command: list[str] | None = None) -> None:
+               command: list[str] | None = None) -> int | None:
     job_id = uuid4().hex
-    env = {**os.environ, RUN_ID_ENV: job_id, "PYTHONUNBUFFERED": "1"}
+    env = {**os.environ, RUN_ID_ENV: job_id, RUN_DAY_ENV: day, "PYTHONUNBUFFERED": "1"}
     flags = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
     if command is None:
-        command = [sys.executable, "-X", "utf8", str(ROOT / "signin.py"), "--submit"]
+        command = [sys.executable] if getattr(sys, "frozen", False) else [
+            sys.executable, "-X", "utf8", str(ROOT / "signin.py"),
+        ]
     log.event("worker_starting", job_id=job_id, day=day, timeout_seconds=config.job_timeout_seconds)
     started = monotonic()
     worker = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL, env=env, **flags)
@@ -102,8 +107,9 @@ def run_worker(config: Settings, log: RunLog, stopping: Event, day: str, *,
         while True:
             if (code := worker.poll()) is not None:
                 log.event("worker_finished", level="info" if code == 0 else "warning", job_id=job_id, day=day,
-                          exit_code=code, job_elapsed_ms=int((monotonic() - started) * 1000))
-                return
+                          exit_code=code, retryable=code == RETRY_EXIT,
+                          job_elapsed_ms=int((monotonic() - started) * 1000))
+                return code
             remaining = deadline - monotonic()
             if remaining <= 0 or stopping.is_set():
                 log.event("worker_cancelled" if stopping.is_set() else "worker_timeout", level="warning",
@@ -116,22 +122,46 @@ def run_worker(config: Settings, log: RunLog, stopping: Event, day: str, *,
 
 
 def daily_loop(config: Settings, log: RunLog, stopping: Event, *, now=None, worker=None,
-               claims: Path = LOG_DIR / "schedule") -> None:
+               elapsed=monotonic, claims: Path = LOG_DIR / "schedule") -> None:
     now = now or (lambda: datetime.now(config.timezone))
     worker = worker or run_worker
     last_day = None
+    pending: tuple[str, float, int] | None = None
     while not stopping.is_set():
         try:
             current = now()
             day = current.date().isoformat()
+            attempt = None
+            if pending is not None:
+                retry_day, retry_at, next_attempt = pending
+                if retry_day != day:
+                    log.event("schedule_retry_expired", day=retry_day, attempt=next_attempt)
+                    pending = None
+                elif elapsed() >= retry_at:
+                    pending = None
+                    if (claims.with_name("attempts") / f"{day}.lock").exists():
+                        log.event("schedule_retry_skipped", day=day, reason="checkin_already_reserved")
+                    else:
+                        attempt = next_attempt
             if day != last_day and current.time() >= config.scheduled_time:
                 allowed = claim_day(claims, day)
                 last_day = day
                 if allowed:
                     log.event("schedule_due", day=day)
-                    worker(config, log, stopping, day)
+                    attempt = 1
                 else:
                     log.event("schedule_day_already_claimed", day=day)
+            if attempt is not None and not stopping.is_set():
+                if attempt > 1:
+                    log.event("schedule_retry_started", day=day, attempt=attempt)
+                code = worker(config, log, stopping, day)
+                if code == RETRY_EXIT and not stopping.is_set():
+                    if attempt <= config.retry_count:
+                        pending = (day, elapsed() + config.retry_delay_seconds, attempt + 1)
+                        log.event("schedule_retry_pending", level="warning", day=day, attempt=attempt + 1,
+                                  delay_seconds=config.retry_delay_seconds)
+                    else:
+                        log.event("schedule_retry_exhausted", level="warning", day=day, attempts=attempt)
         except Exception as exc:
             log.exception("schedule_iteration_failed", exc)
         stopping.wait(POLL_SECONDS)
@@ -149,7 +179,8 @@ def watch(config: Settings) -> int:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         with FileLock(LOG_DIR / "watch.lock", timeout=0):
             log.event("schedule_started", local_time=config.scheduled_time.strftime("%H:%M"),
-                      timezone=config.timezone.key, timeout_seconds=config.job_timeout_seconds)
+                      timezone=config.timezone.key, timeout_seconds=config.job_timeout_seconds,
+                      retry_count=config.retry_count, retry_delay_seconds=config.retry_delay_seconds)
             try:
                 daily_loop(config, log, stopping)
             finally:

@@ -1,12 +1,13 @@
 [schedule]
-enabled = false
+enable = false # false: sign in once; true: keep running on the daily schedule.
 time = "09:00"
 timezone = "Asia/Shanghai"
 job_timeout_seconds = 600 # Total limit for each scheduled child process.
+retry_count = 2 # Additional attempts for known transient failures before a POST.
+retry_delay_seconds = 300
 
 [browser]
 profile = ".cloak-profile"
-executable = "" # Empty: detect Cloak or download it to .cloak-bin/.
 headless = true
 timeout_ms = 20000
 challenge_wait_seconds = 10 # Passive wait in modes that restore login; 0 disables it.

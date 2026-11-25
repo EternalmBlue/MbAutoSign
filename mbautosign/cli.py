@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import argparse
 import os
 import re
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -12,21 +12,22 @@ from urllib.parse import urljoin
 from filelock import FileLock, Timeout as LockTimeout
 from playwright.sync_api import CDPSession, Error as BrowserError, Page, Route, TimeoutError as BrowserTimeout, sync_playwright
 
-from .cloak_runtime import CloakError, resolve_cloak
-from .minebbs_login import HOME, restore_login, session_state
+from .cloak_runtime import CloakDownloadUnavailable, CloakError, resolve_cloak
+from .minebbs_login import HOME, home_network_failure, restore_login, session_state, transient_home_status
 from .runlog import RunLog
-from .scheduler import RUN_ID_ENV, claim_day, watch
+from .scheduler import RUN_DAY_ENV, RUN_ID_ENV, RETRY_EXIT, claim_day, watch
 from .settings import LOG_DIR, ConfigError, Settings, load_settings
 
 
 CLOCK = urljoin(HOME, "/credits/clock")
 FORM = ".mjc-signin-status form.mjc-signin-form"
-OK = {"ready", "signed", "already_signed", "attempt_already_reserved", "logged_in", "already_logged_in"}
+OK = {"signed", "already_signed", "attempt_already_reserved", "scheduled_day_expired"}
 
 
 @dataclass
 class CheckFlow:
     log: RunLog
+    scheduled_day: str | None = None
     phase: str = "start"
     armed: bool = False
     reserved: bool = False
@@ -79,6 +80,8 @@ def inspect_home(page: Page, flow: CheckFlow, phase: str = "check_home") -> dict
     session = "unknown"
     if status == 468:
         state = "security_check"
+    elif transient_home_status(status):
+        state = "homepage_failed"
     else:
         state = page_state(page)
         if status != 200 and state not in {"security_check", "unexpected_page"}:
@@ -88,6 +91,8 @@ def inspect_home(page: Page, flow: CheckFlow, phase: str = "check_home") -> dict
             if session == "signed_out":
                 state = "login_required"
     details = {"home_status": status, "session_state": session, "post_count": flow.posts, "result": state}
+    if transient_home_status(status):
+        details["retryable"] = True
     flow.log.event("homepage_checked", phase=phase, **details)
     return details
 
@@ -97,6 +102,8 @@ def submit_checkin(page: Page, cdp: CDPSession, config: Settings, flow: CheckFlo
         return {**result, "result": "session_not_confirmed"}
     flow.stage("reserve_checkin")
     day = datetime.now(config.timezone).date().isoformat()
+    if flow.scheduled_day is not None and day != flow.scheduled_day:
+        return {**result, "result": "scheduled_day_expired"}
     if not claim_day(LOG_DIR / "attempts", day):
         return {**result, "result": "attempt_already_reserved"}
     flow.reserved = True
@@ -166,7 +173,9 @@ def submit_checkin(page: Page, cdp: CDPSession, config: Settings, flow: CheckFlo
     try:
         verified = inspect_home(page, flow, "verify_checkin")
     except Exception as exc:
-        flow.log.exception("checkin_verification_failed", exc, post_count=flow.posts)
+        details = home_network_failure(exc)
+        details.pop("retryable", None)
+        flow.log.exception("checkin_verification_failed", exc, post_count=flow.posts, **details)
         return {**result, "result": "confirmation_missing"}
     return {**result, "verify_status": verified["home_status"],
             "result": "signed" if verified["result"] == "already_signed" else "confirmation_missing"}
@@ -175,15 +184,21 @@ def submit_checkin(page: Page, cdp: CDPSession, config: Settings, flow: CheckFlo
 @contextmanager
 def browser_session(config: Settings, flow: CheckFlow):
     flow.stage("resolve_cloak")
-    executable = resolve_cloak(config, flow.log)
+    executable = resolve_cloak(flow.log)
     flow.stage("lock_profile")
     initialized = (config.profile / "Local State").is_file()
     config.profile.mkdir(parents=True, exist_ok=True)
     with FileLock(config.profile / ".mbautosign.lock", timeout=0), managed_playwright(flow) as playwright:
         flow.stage("launch_browser", headless=config.headless, profile_initialized=initialized)
+        browser_env = dict(os.environ)
+        if sys.platform.startswith("linux") and getattr(sys, "frozen", False):
+            if original := browser_env.pop("LD_LIBRARY_PATH_ORIG", None):
+                browser_env["LD_LIBRARY_PATH"] = original
+            else:
+                browser_env.pop("LD_LIBRARY_PATH", None)
         context = playwright.chromium.launch_persistent_context(
             user_data_dir=config.profile, executable_path=executable, headless=config.headless,
-            service_workers="block", timeout=config.timeout_ms,
+            service_workers="block", timeout=config.timeout_ms, env=browser_env,
         )
         flow.log.event("browser_opened", headless=config.headless)
         try:
@@ -204,6 +219,7 @@ def managed_playwright(flow: CheckFlow):
 
 
 def failure(flow: CheckFlow, exc: Exception) -> dict:
+    network = home_network_failure(exc) if flow.phase in {"check_home", "verify_login"} else {}
     if flow.reserved:
         outcome = "submission_outcome_unknown"
     elif flow.phase == "lock_profile" and isinstance(exc, LockTimeout):
@@ -216,13 +232,18 @@ def failure(flow: CheckFlow, exc: Exception) -> dict:
         outcome = "cloak_unavailable"
     elif flow.phase == "start_playwright":
         outcome = "playwright_driver_failed"
+    elif network:
+        outcome = "operation_timed_out" if network["network_error"] == "timeout" else "homepage_unreachable"
     elif isinstance(exc, (BrowserTimeout, TimeoutError, LockTimeout)):
         outcome = "operation_timed_out"
     else:
         outcome = "run_failed"
-    details = {"phase": flow.phase, "result": outcome, "post_count": flow.posts, "attempt_reserved": flow.reserved}
+    details = {"phase": flow.phase, "result": outcome, "post_count": flow.posts, "attempt_reserved": flow.reserved,
+               **network}
     if isinstance(exc, CloakError):
         details["cloak_error"] = str(exc)  # All CloakError messages are fixed local diagnostics.
+    if isinstance(exc, CloakDownloadUnavailable):
+        details["retryable"] = True
     if flow.phase == "launch_browser" and isinstance(exc, BrowserError):
         if library := re.search(r"shared libraries: (lib[A-Za-z0-9_.+-]{1,80})", str(exc)):
             details["missing_library"] = library[1]
@@ -232,13 +253,18 @@ def failure(flow: CheckFlow, exc: Exception) -> dict:
 
 def emit_result(flow: CheckFlow, result: dict) -> int:
     ok = result["result"] in OK
+    retryable = (not ok and result.get("retryable", False) and not flow.reserved
+                 and flow.posts == 0 and result.get("login_post_count", 0) == 0)
+    if "retryable" in result:
+        result["retryable"] = retryable
     flow.log.event("run_finished", level="info" if ok else "warning", **result)
-    return 0 if ok else 1
+    return 0 if ok else RETRY_EXIT if retryable and flow.scheduled_day is not None else 1
 
 
-def run_once(config: Settings, submit: bool, login_only: bool = False, *, log: RunLog | None = None) -> int:
-    flow = CheckFlow(log or RunLog("login-only" if login_only else "automatic" if submit else "read-only", config.timezone))
-    flow.log.event("run_started", submit=submit, login_only=login_only)
+def run_once(config: Settings, *, log: RunLog,
+             scheduled_day: str | None = None) -> int:
+    flow = CheckFlow(log, scheduled_day=scheduled_day)
+    log.event("run_started")
     result = None
     login_details = {}
     try:
@@ -254,7 +280,7 @@ def run_once(config: Settings, submit: bool, login_only: bool = False, *, log: R
             cdp.send("Emulation.setScriptExecutionDisabled", {"value": True})
             home = inspect_home(page, flow)
             security_wait_requested = home["result"] == "security_check" and config.challenge_wait_seconds > 0
-            if (submit or login_only) and (home["result"] == "login_required" or security_wait_requested):
+            if home["result"] == "login_required" or security_wait_requested:
                 flow.stage("restore_login", reason=home["result"])
                 if home["result"] == "login_required" and not (config.username and config.password):
                     login_details = {"login_result": "credentials_missing", "login_post_count": 0}
@@ -266,16 +292,13 @@ def run_once(config: Settings, submit: bool, login_only: bool = False, *, log: R
                     home = inspect_home(page, flow, "verify_login")
                     if home["session_state"] == "signed_in":
                         login_details["login_result"] = "logged_in"
-                        if login_only:
-                            home["result"] = "logged_in"
                     else:
-                        status = "verification_required" if home["result"] == "security_check" else "login_not_confirmed"
+                        status = ("verification_required" if home["result"] == "security_check" else
+                                  "homepage_failed" if home["result"] == "homepage_failed" else "login_not_confirmed")
                         login_details["login_result"] = home["result"] = status
                 else:
                     home["result"] = login_details["login_result"]
-            elif login_only and home["session_state"] == "signed_in":
-                home["result"] = "already_logged_in"
-            result = submit_checkin(page, cdp, config, flow, home) if submit and home["result"] == "ready" else home
+            result = submit_checkin(page, cdp, config, flow, home) if home["result"] == "ready" else home
     except Exception as exc:
         if result is None:
             result = failure(flow, exc)
@@ -285,35 +308,35 @@ def run_once(config: Settings, submit: bool, login_only: bool = False, *, log: R
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="MineBBS 签到，默认只检查。")
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--check", action="store_true", help="只读取首页，不提交（默认）。")
-    mode.add_argument("--login", action="store_true", help="检查并在需要时重新登录，不提交签到。")
-    mode.add_argument("--submit", action="store_true", help="签到一次；已签到时跳过。")
-    mode.add_argument("--watch", action="store_true", help="按 config.toml 每天运行；需要进程保持运行。")
-    options = parser.parse_args()
-
-    mode_name = ("watch" if options.watch else "login-only" if options.login else
-                 "automatic" if options.submit else "read-only")
     run_id = os.environ.get(RUN_ID_ENV, "")
-    log = RunLog(mode_name, run_id=run_id if options.submit and re.fullmatch(r"[0-9a-f]{32}", run_id) else None)
+    scheduled = bool(re.fullmatch(r"[0-9a-f]{32}", run_id))
+    log = RunLog("automatic" if scheduled else "single", run_id=run_id if scheduled else None)
+    if len(sys.argv) != 1:
+        log.event("arguments_not_supported", level="error", action="直接运行程序；在 config.toml 设置 schedule.enable。")
+        return 2
     try:
-        config = load_settings()
+        try:
+            config = load_settings()
+        except FileNotFoundError:
+            log.event("configuration_file_missing", level="error",
+                      action="请在程序所在目录创建 config.toml，参考 config.example.toml 填写登录和调度配置后重试。")
+            return 2
         log.tz = config.timezone
-        if options.watch:
+        if config.enabled and not scheduled:
             return watch(config)
-        if options.submit and re.fullmatch(r"[0-9a-f]{32}", run_id) and not config.enabled:
+        if scheduled and not config.enabled:
             log.event("scheduled_job_disabled", result="skipped")
             return 0
-        return run_once(config, options.submit, options.login, log=log)
+        scheduled_day = os.environ.get(RUN_DAY_ENV) if scheduled else None
+        if scheduled and scheduled_day != datetime.now(config.timezone).date().isoformat():
+            log.event("scheduled_day_expired", result="skipped")
+            return 0
+        return run_once(config, log=log, scheduled_day=scheduled_day)
     except KeyboardInterrupt:
         log.event("run_cancelled")
         return 130
     except ConfigError as exc:
         log.exception("configuration_invalid", exc, setting_error=str(exc))
-        return 2
-    except FileNotFoundError as exc:
-        log.exception("configuration_file_missing", exc)
         return 2
     except Exception as exc:
         log.exception("command_failed", exc)

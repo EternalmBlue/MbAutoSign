@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import multiprocessing
 import os
 import platform
-import re
 import shutil
+import socket
+import ssl
 import stat
 import tarfile
 import tempfile
@@ -13,24 +15,36 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from filelock import FileLock
 
 from .runlog import RunLog
-from .settings import ROOT, Settings
+from .settings import ROOT
 
 
 CACHE = ROOT / ".cloak-bin"
 RELEASES = (("official", "https://cloakbrowser.dev"),
             ("github", "https://github.com/CloakHQ/CloakBrowser/releases/download"))
-VERSION_DIR = re.compile(r"chromium-([0-9]+(?:\.[0-9]+){3,4})(?:-pro)?\Z")
+DOWNLOAD_TIMEOUT_SECONDS = 540
+TRANSFER_RETRYABLE, TRANSFER_REJECTED, TRANSFER_FAILED = 10, 11, 12
 
 
 class CloakError(RuntimeError):
     pass
+
+
+class CloakDownloadUnavailable(CloakError):
+    """At least one compatible source could recover later."""
+
+
+class SourceError(CloakError):
+    def __init__(self, reason: str, *, retryable: bool = False, status: int | None = None):
+        super().__init__(reason)
+        self.retryable = retryable
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -76,32 +90,27 @@ def binary_in(folder: Path, system: str) -> Path | None:
     return None
 
 
-def configured_binary(path: Path, system: str) -> Path | None:
-    try:
-        resolved = path.resolve()
-    except (OSError, RuntimeError):
-        return None
-    # A generic Chrome/Chromium executable must not be used as a fallback.
-    for version in (resolved.parent, resolved.parent.parent):
-        in_cache = version.parent.name == ".cloakbrowser" or version.parent.parent.name == ".cloak-bin"
-        if VERSION_DIR.fullmatch(version.name) and in_cache:
-            if binary_in(version, system) == resolved:
-                return resolved
-    return None
-
-
-def installed_binary(cache: Path, home_cache: Path, system: str) -> tuple[Path, str] | None:
+def installed_binary(cache: Path, home_cache: Path, system: str, version: str) -> tuple[Path, str] | None:
     for parent, source in ((cache, "project_cache"), (home_cache, "local_install")):
-        if not parent.is_dir():
-            continue
-        candidates = []
-        for folder in parent.iterdir():
-            version = VERSION_DIR.fullmatch(folder.name)
-            if version and not folder.is_symlink() and (binary := binary_in(folder, system)):
-                candidates.append((tuple(map(int, version[1].split("."))), binary))
-        if candidates:
-            return max(candidates)[1], source
+        folder = parent / f"chromium-{version}"
+        if not parent.is_symlink() and not folder.is_symlink() and (binary := binary_in(folder, system)):
+            return binary, source
     return None
+
+
+def source_error(exc: OSError | http.client.HTTPException) -> SourceError:
+    if isinstance(exc, HTTPError):
+        return SourceError("http_status", status=exc.code, retryable=exc.code in {408, 429} or 500 <= exc.code < 600)
+    reason = exc.reason if isinstance(exc, URLError) else exc
+    if isinstance(reason, ssl.SSLError):
+        return SourceError("tls")
+    if isinstance(reason, socket.gaierror):
+        return SourceError("dns", retryable=True)
+    if isinstance(reason, TimeoutError):
+        return SourceError("timeout", retryable=True)
+    if isinstance(reason, http.client.IncompleteRead):
+        return SourceError("incomplete_download", retryable=True)
+    return SourceError("network", retryable=True)
 
 
 def download_from(url: str, asset: Asset, path: Path, log: RunLog, deadline: float) -> None:
@@ -109,38 +118,97 @@ def download_from(url: str, asset: Asset, path: Path, log: RunLog, deadline: flo
     received = 0
     digest = hashlib.sha256()
     progress = time.monotonic()
-    with urlopen(request, timeout=30) as response, path.open("xb") as output:
+    try:
+        response = urlopen(request, timeout=30)
+    except (OSError, http.client.HTTPException) as exc:
+        raise source_error(exc) from exc
+    with response, path.open("xb") as output:
         if not response.geturl().startswith("https://"):
-            raise CloakError("Download left HTTPS")
-        while chunk := response.read(1024 * 1024):
+            raise SourceError("not_https")
+        while True:
+            try:
+                chunk = response.read(1024 * 1024)
+            except (OSError, http.client.HTTPException) as exc:
+                raise source_error(exc) from exc
+            now = time.monotonic()
+            if now >= deadline:
+                raise SourceError("timeout", retryable=True)
+            if not chunk:
+                break
             received += len(chunk)
             if received > asset.size:
-                raise CloakError("Archive exceeds the pinned asset size")
+                raise SourceError("oversized_download")
             digest.update(chunk)
             output.write(chunk)
-            now = time.monotonic()
-            if now > deadline:
-                raise TimeoutError("Cloak download timed out")
             if now - progress >= 20:
                 log.event("cloak_download_progress", bytes_received=received, bytes_total=asset.size)
                 progress = now
-    if received != asset.size or digest.hexdigest() != asset.sha256:
-        raise CloakError("Cloak release size or SHA-256 verification failed")
+    if received != asset.size:
+        raise SourceError("incomplete_download", retryable=True)
+    if digest.hexdigest() != asset.sha256:
+        raise SourceError("sha256_mismatch")
     log.event("cloak_download_verified", bytes_received=received)
 
 
+def transfer_worker(source: str, url: str, asset: Asset, path: Path, log: RunLog, deadline: float) -> None:
+    try:
+        download_from(url, asset, path, log, deadline)
+    except SourceError as exc:
+        log.event("cloak_download_source_failed", level="warning", source=source, reason=str(exc),
+                  http_status=exc.status, retryable=exc.retryable)
+        raise SystemExit(TRANSFER_RETRYABLE if exc.retryable else TRANSFER_REJECTED) from None
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+    except Exception as exc:
+        log.exception("cloak_download_worker_failed", exc, source=source)
+        raise SystemExit(TRANSFER_FAILED) from None
+
+
+def bounded_transfer(target, args: tuple, deadline: float) -> int | None:
+    # A blocked DNS lookup or socket read cannot enforce its own total timeout.
+    worker = multiprocessing.get_context("spawn").Process(target=target, args=args, daemon=True)
+    try:
+        worker.start()
+        worker.join(max(0, deadline - time.monotonic()))
+        return worker.exitcode
+    finally:
+        if worker.pid is not None and worker.exitcode is None:
+            worker.kill()
+            worker.join(timeout=5)
+            if worker.exitcode is None:
+                raise CloakError("Cloak download worker did not stop")
+        worker.close()
+
+
 def download(asset: Asset, path: Path, log: RunLog) -> None:
-    deadline = time.monotonic() + 540
+    deadline = time.monotonic() + DOWNLOAD_TIMEOUT_SECONDS
+    retryable = False
     for index, (source, base) in enumerate(RELEASES):
-        log.event("cloak_download_source", source=source)
-        try:
-            download_from(f"{base}/chromium-v{asset.version}/{asset.filename}", asset, path, log, deadline)
+        now = time.monotonic()
+        remaining = deadline - now
+        if remaining <= 0:
+            retryable = True
+            break
+        # Leave time for the alternate if the first source stalls.
+        budget = remaining / (len(RELEASES) - index)
+        cutoff = now + budget
+        log.event("cloak_download_source", source=source, timeout_seconds=round(budget, 2))
+        url = f"{base}/chromium-v{asset.version}/{asset.filename}"
+        code = bounded_transfer(transfer_worker, (source, url, asset, path, log, cutoff), cutoff)
+        if code == 0:
             return
-        except (URLError, TimeoutError, ConnectionError, http.client.IncompleteRead) as exc:
-            log.exception("cloak_download_source_failed", exc, source=source)
-            if index == len(RELEASES) - 1 or time.monotonic() >= deadline:
-                raise
-            path.unlink(missing_ok=True)
+        if code == 130:
+            raise KeyboardInterrupt
+        if code not in {None, TRANSFER_RETRYABLE, TRANSFER_REJECTED}:
+            log.event("cloak_download_worker_exit", level="error", source=source, exit_code=code)
+            raise CloakError("Cloak download worker failed")
+        if code is None:
+            log.event("cloak_download_source_failed", level="warning", source=source, reason="timeout", retryable=True)
+        retryable |= code in {None, TRANSFER_RETRYABLE}
+        path.unlink(missing_ok=True)
+    if retryable:
+        raise CloakDownloadUnavailable("All Cloak download sources failed; a source may recover later")
+    raise CloakError("All Cloak download sources were rejected")
 
 
 def extract(archive: Path, destination: Path, *, is_zip: bool) -> None:
@@ -180,7 +248,7 @@ def extract(archive: Path, destination: Path, *, is_zip: bool) -> None:
                     raise CloakError("Unexpected non-file member in Cloak TAR archive")
 
 
-def resolve_cloak(config: Settings, log: RunLog, *, cache: Path = CACHE, home_cache: Path | None = None) -> Path:
+def resolve_cloak(log: RunLog, *, cache: Path = CACHE, home_cache: Path | None = None) -> Path:
     system, arch = platform_key()
     asset = ASSETS.get((system, arch))
     if asset is None:
@@ -190,13 +258,8 @@ def resolve_cloak(config: Settings, log: RunLog, *, cache: Path = CACHE, home_ca
     cache = cache / f"{system.lower()}-{arch}"
     if cache.is_symlink():
         raise CloakError("The Cloak platform cache must be a real directory")
-    if config.executable is not None:
-        if binary := configured_binary(config.executable, system):
-            log.event("cloak_ready", source="configured", platform=system, arch=arch)
-            return binary
-        log.event("cloak_configured_path_rejected", level="warning", platform=system, arch=arch)
     home_cache = Path.home() / ".cloakbrowser" if home_cache is None else home_cache
-    if found := installed_binary(cache, home_cache, system):
+    if found := installed_binary(cache, home_cache, system, asset.version):
         binary, source = found
         log.event("cloak_ready", source=source, platform=system, arch=arch)
         return binary
@@ -204,7 +267,7 @@ def resolve_cloak(config: Settings, log: RunLog, *, cache: Path = CACHE, home_ca
     cache = cache.resolve()
     cache.mkdir(parents=True, exist_ok=True)
     with FileLock(cache / ".install.lock", timeout=60):
-        if found := installed_binary(cache, home_cache, system):
+        if found := installed_binary(cache, home_cache, system, asset.version):
             binary, source = found
             log.event("cloak_ready", source=source, platform=system, arch=arch)
             return binary

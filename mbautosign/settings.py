@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from datetime import time
@@ -8,7 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
 LOG_DIR = ROOT / "logs"
 
 
@@ -19,7 +20,6 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class Settings:
     profile: Path
-    executable: Path | None
     headless: bool
     timeout_ms: int
     enabled: bool
@@ -29,6 +29,8 @@ class Settings:
     password: str = field(default="", repr=False)
     challenge_wait_seconds: int = 10
     job_timeout_seconds: int = 600
+    retry_count: int = 2
+    retry_delay_seconds: int = 300
 
 
 def load_settings(path: Path = ROOT / "config.toml") -> Settings:
@@ -59,6 +61,13 @@ def load_settings(path: Path = ROOT / "config.toml") -> Settings:
             raise ConfigError(f"{keys[id(section)]}.{name} 必须在 {low} 到 {high} 之间。")
         return value
 
+    if "enable" in schedule:
+        enabled = get(schedule, "enable", bool)
+        if "enabled" in schedule and get(schedule, "enabled", bool) != enabled:
+            raise ConfigError("schedule.enable 与旧字段 schedule.enabled 冲突，请只保留 schedule.enable。")
+    else:
+        enabled = get(schedule, "enabled", bool)  # Existing configurations used this spelling.
+
     launch_at = get(schedule, "time", str)
     if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", launch_at):
         raise ConfigError("schedule.time 必须使用 HH:MM 格式。")
@@ -73,19 +82,17 @@ def load_settings(path: Path = ROOT / "config.toml") -> Settings:
     profile = (path.parent / Path(profile_name).expanduser()).resolve()
     if profile in {profile.parent, path.parent.resolve(), Path.home().resolve()}:
         raise ConfigError("browser.profile 不能是根目录、项目目录或用户主目录。")
-    executable = get(browser, "executable", str, "").strip()
-    if "\x00" in executable:
-        raise ConfigError("browser.executable 路径无效。")
     return Settings(
         profile=profile,
-        executable=(path.parent / Path(executable).expanduser()) if executable else None,
         headless=get(browser, "headless", bool),
         timeout_ms=bounded(browser, "timeout_ms", 20000, 100, 180000),
-        enabled=get(schedule, "enabled", bool),
+        enabled=enabled,
         scheduled_time=time.fromisoformat(launch_at),
         timezone=timezone,
         username=get(login, "username", str, "").strip(),
         password=get(login, "password", str, ""),
         challenge_wait_seconds=bounded(browser, "challenge_wait_seconds", 10, 0, 120),
         job_timeout_seconds=bounded(schedule, "job_timeout_seconds", 600, 1, 7200),
+        retry_count=bounded(schedule, "retry_count", 2, 0, 5),
+        retry_delay_seconds=bounded(schedule, "retry_delay_seconds", 300, 15, 3600),
     )
