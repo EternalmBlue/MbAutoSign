@@ -11,7 +11,6 @@ import signal
 import subprocess
 import sys
 import sysconfig
-import tarfile
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep
 
@@ -44,41 +43,6 @@ def write_notices(path: Path) -> None:
                 if file.is_file():
                     blocks.append(f"--- {entry} ---\n" + file.read_text(encoding="utf-8", errors="replace"))
     path.write_text("\n\n".join(blocks), encoding="utf-8")
-
-
-def make_linux_installer(package: Path, output: Path, scratch: Path) -> None:
-    archive = scratch / "payload.tar.gz"
-    with tarfile.open(archive, "w:gz", compresslevel=6) as stream:
-        for entry in sorted(package.iterdir()):
-            stream.add(entry, arcname=entry.name)
-    header = """#!/usr/bin/env bash
-set -euo pipefail
-if (( $# > 1 )); then
-    printf 'Usage: %s [new-install-directory]\n' "$0" >&2
-    exit 2
-fi
-destination=${1:-./MbAutoSign}
-parent=$(dirname -- "$destination")
-if [[ -e "$destination" || -L "$destination" ]]; then
-    printf 'Install directory already exists: %s\n' "$destination" >&2
-    exit 2
-fi
-staging=$(mktemp -d -- "$parent/.mbautosign-install-XXXXXXXX")
-trap 'rm -rf -- "$staging"' EXIT
-tail -n +PAYLOAD_LINE -- "$0" | tar -xz -C "$staging"
-mv -nT -- "$staging" "$destination"
-if [[ -d "$staging" ]]; then
-    printf 'Install directory already exists: %s\n' "$destination" >&2
-    exit 2
-fi
-printf 'Installed in %s. Create config.toml from config.example.toml, then run run-linux.sh.\n' "$destination"
-exit 0
-"""
-    header = header.replace("PAYLOAD_LINE", str(header.count("\n") + 1))
-    with output.open("wb") as target, archive.open("rb") as payload:
-        target.write(header.encode("ascii"))
-        shutil.copyfileobj(payload, target)
-    output.chmod(0o755)
 
 
 def smoke(command: list[str], root: Path, scratch: Path) -> None:
@@ -162,41 +126,41 @@ def build(output: Path) -> None:
     if (system, arch) not in {("Windows", "x64"), ("Linux", "x64"), ("Linux", "arm64")}:
         raise RuntimeError(f"Unsupported build target: {system}/{arch}")
     windows = system == "Windows"
-    name = "MbAutoSign-windows-x64" if windows else "MbAutoSign"
+    name = "MbAutoSign"
+    distribution = f"{name}-{system.lower()}-{arch}"
+    executable = f"{name}.exe" if windows else name
+    launcher = "run-windows.ps1" if windows else "run-linux.sh"
     output.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix="mbautosign-release-") as temp:
         work = Path(temp)
         target = work / "dist"
         subprocess.run([
             sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--noupx",
-            "--onefile" if windows else "--onedir", "--name", name,
+            "--onefile", "--name", name,
             "--collect-all", "playwright", "--collect-data", "tzdata",
             "--distpath", str(target), "--workpath", str(work / "build"), "--specpath", str(work),
             str(ROOT / "signin.py"),
         ], cwd=ROOT, check=True)
+        package = work / distribution
+        package.mkdir()
+        shutil.move(target / executable, package / executable)
+        shutil.copyfile(PACKAGING / launcher, package / launcher)
+        if not windows:
+            (package / launcher).chmod(0o755)
+        shutil.copyfile(ROOT / "config.example.toml", package / "config.example.toml")
+        write_notices(package / "THIRD-PARTY-NOTICES.txt")
+
+        archive = Path(shutil.make_archive(str(package), "zip" if windows else "gztar",
+                                          root_dir=work, base_dir=distribution))
+        extracted = work / "extracted with spaces"
+        shutil.unpack_archive(archive, extracted)
+        installed = extracted / distribution
+        command = [str(installed / launcher)]
         if windows:
-            exe = target / f"{name}.exe"
-            launcher = target / "run-windows.cmd"
-            shutil.copyfile(PACKAGING / launcher.name, launcher)
-            smoke([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(launcher)], target, work)
-            shutil.copyfile(exe, output / exe.name)
-            shutil.copyfile(launcher, output / launcher.name)
-            shutil.copyfile(ROOT / "config.example.toml", output / "config.example.toml")
-            write_notices(output / "THIRD-PARTY-NOTICES-windows-x64.txt")
-        else:
-            package = target / name
-            launcher = package / "run-linux.sh"
-            shutil.copyfile(PACKAGING / launcher.name, launcher)
-            launcher.chmod(0o755)
-            shutil.copyfile(ROOT / "config.example.toml", package / "config.example.toml")
-            write_notices(package / "THIRD-PARTY-NOTICES.txt")
-            installer = work / f"MbAutoSign-linux-{arch}.sh"
-            make_linux_installer(package, installer, work)
-            installed = work / "installed with spaces"
-            subprocess.run(["bash", str(installer), str(installed)], cwd=work, check=True, timeout=90)
-            smoke([str(installed / launcher.name)], installed, work)
-            shutil.copy2(installer, output / installer.name)
-            shutil.copy2(launcher, output / launcher.name)
+            command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "RemoteSigned",
+                       "-File", *command]
+        smoke(command, installed, work)
+        shutil.copy2(archive, output / archive.name)
 
 
 if __name__ == "__main__":

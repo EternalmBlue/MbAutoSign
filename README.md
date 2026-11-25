@@ -4,16 +4,16 @@
 
 ## 下载安装
 
-从 [GitHub Releases](https://github.com/EternalmBlue/MbAutoSign/releases) 下载对应平台的文件。发行包已包含 Python 和运行依赖，不需要另装 Python。可用发行页的 `SHA256SUMS` 验证文件。
+从 [GitHub Releases](https://github.com/EternalmBlue/MbAutoSign/releases) 下载对应平台的压缩包。每个包都包含本平台的可执行文件、启动脚本、示例配置和第三方声明。无需另装 Python，可用发行页的 `SHA256SUMS` 校验压缩包。
 
-- **Windows x64**：把 `MbAutoSign-windows-x64.exe`、`run-windows.cmd` 和 `config.example.toml` 放在同一目录。填写配置后运行 `run-windows.cmd`，也可以直接运行 EXE。
-- **Linux x64 / ARM64**：运行 `bash MbAutoSign-linux-x64.sh` 或 `bash MbAutoSign-linux-arm64.sh`。默认解包到当前目录的 `MbAutoSign/`，也可在命令末尾指定新的安装目录。进入安装目录，填写配置后运行 `./run-linux.sh`。安装包已包含启动脚本和示例配置，不会覆盖现有安装目录。
+- **Windows x64**：解压 `MbAutoSign-windows-x64.zip`，进入解压目录。填写配置后，在 PowerShell 运行 `.\run-windows.ps1`，也可以直接运行 `MbAutoSign.exe`。若 PowerShell 因文件来自网络而拒绝运行，校验压缩包后可执行 `Unblock-File .\run-windows.ps1`。
+- **Linux x64 / ARM64**：用 `tar -xzf MbAutoSign-linux-x64.tar.gz`（ARM64 将文件名换成 `MbAutoSign-linux-arm64.tar.gz`）解压，然后进入同名目录。填写配置后运行 `./run-linux.sh`，也可以直接运行原生二进制 `./MbAutoSign`。
 
 Linux 发行包以 Ubuntu 22.04 为构建基线。Cloak Browser 仍需要系统的共享库，如 libatomic、NSS、GTK、X11，安装包不更改系统依赖。无桌面的主机请保持 `browser.headless = true`。
 
 ## 配置和运行
 
-在 EXE 或 Linux 安装后的 `MbAutoSign` 程序旁**手动创建** `config.toml`，参考 `config.example.toml` 填写。找不到配置时，程序会在终端和 `logs/checkins.jsonl` 提醒你创建并填写，然后退出。程序不会生成或修改配置文件。
+在解压后、与可执行文件同一目录**手动创建** `config.toml`，参考 `config.example.toml` 填写。找不到配置时，程序会在终端和 `logs/checkins.jsonl` 提醒你创建并填写，然后退出。程序不会生成或修改配置文件。
 
 - `schedule.enable = false`：启动后尝试签到一次，完成或失败即退出。
 - `schedule.enable = true`：进程常驻，按 `schedule.time` 和 `schedule.timezone` 每日执行。启动时若已过当天设定时间，会执行当天尚未认领的任务。
