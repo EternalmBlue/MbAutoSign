@@ -22,6 +22,16 @@ from .settings import LOG_DIR, ConfigError, Settings, load_settings
 CLOCK = urljoin(HOME, "/credits/clock")
 FORM = ".mjc-signin-status form.mjc-signin-form"
 OK = {"signed", "already_signed", "attempt_already_reserved", "scheduled_day_expired"}
+CHECKIN_PAYLOAD_JS = """
+        function readCheckinPayload(form) {
+            const fields = [...form.elements].filter(x => x.type === 'hidden' && !x.matches(':disabled'));
+            const tokens = fields.filter(x => x.name === '_xfToken');
+            const currencies = fields.filter(x => x.name === 'currency_ids[]');
+            if (tokens.length !== 1 || !tokens[0].value.trim() ||
+                !currencies.length || currencies.some(x => !x.value.trim())) return null;
+            return new URLSearchParams([...tokens, ...currencies].map(x => [x.name, x.value]));
+        }
+"""
 
 
 @dataclass
@@ -51,7 +61,7 @@ class CheckFlow:
 
 
 def page_state(page: Page) -> str:
-    return page.evaluate("""({home, clock, selector}) => {
+    return page.evaluate("""({home, clock, selector}) => {""" + CHECKIN_PAYLOAD_JS + """
         if (location.href !== home) return 'unexpected_page';
         if (document.querySelector('#slg-box')) return 'security_check';
         const boxes = document.querySelectorAll('.mjc-signin-status');
@@ -65,11 +75,7 @@ def page_state(page: Page) -> str:
             form.enctype !== 'application/x-www-form-urlencoded' || !status.includes('今日尚未签到')) {
             return 'unexpected_form';
         }
-        const fields = [...form.elements].filter(x => x.type === 'hidden' && x.name && !x.matches(':disabled'));
-        const tokens = fields.filter(x => x.name === '_xfToken');
-        const currencies = fields.filter(x => x.name === 'currency_ids[]');
-        return tokens.length === 1 && tokens[0].value && currencies.length === 2 && currencies.every(x => x.value)
-            ? 'ready' : 'missing_fields';
+        return readCheckinPayload(form) ? 'ready' : 'missing_fields';
     }""", {"home": HOME, "clock": CLOCK, "selector": FORM})
 
 
@@ -129,16 +135,12 @@ def submit_checkin(page: Page, cdp: CDPSession, config: Settings, flow: CheckFlo
     cdp.on("Network.responseReceived", response_received)
     try:
         flow.armed = True
-        fetch_status = page.locator(FORM).evaluate("""async (form, {clock, timeout}) => {
-            if (form.action !== clock || form.method !== 'post') throw new Error('The form changed');
-            const data = new URLSearchParams();
-            const inputs = [...form.elements].filter(x => x.type === 'hidden' && !x.matches(':disabled'));
-            const tokens = inputs.filter(x => x.name === '_xfToken');
-            const currencies = inputs.filter(x => x.name === 'currency_ids[]');
-            if (tokens.length !== 1 || !tokens[0].value || currencies.length !== 2 || !currencies.every(x => x.value)) {
-                throw new Error('The fields changed');
+        fetch_status = page.locator(FORM).evaluate("""async (form, {clock, timeout}) => {""" + CHECKIN_PAYLOAD_JS + """
+            if (form.action !== clock || form.method !== 'post' || form.enctype !== 'application/x-www-form-urlencoded') {
+                throw new Error('The form changed');
             }
-            for (const input of [...tokens, ...currencies]) data.append(input.name, input.value);
+            const data = readCheckinPayload(form);
+            if (!data) throw new Error('The fields changed');
             const response = await fetch(clock, {
                 method: 'POST', credentials: 'same-origin', redirect: 'manual', body: data,
                 signal: AbortSignal.timeout(timeout),

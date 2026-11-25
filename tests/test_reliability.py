@@ -5,6 +5,7 @@ import io
 import json
 import os
 import socket
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -20,6 +21,7 @@ from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 import psutil
+from playwright._impl._driver import compute_driver_executable
 from playwright.sync_api import Error as BrowserError, TimeoutError as BrowserTimeout
 
 from mbautosign import cli as signin
@@ -336,6 +338,67 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(old["event"], "first")
         self.assertEqual(json.loads(current)["error_type"], "ValueError")
         self.assertNotIn("fixture secret", current)
+
+    def test_checkin_uses_all_enabled_currency_fields_in_both_guards(self):
+        page = Mock()
+        signin.page_state(page)
+        page_script, page_args = page.evaluate.call_args.args
+        page.locator.return_value.evaluate.side_effect = RuntimeError("capture the browser callback")
+        with patch.object(signin, "claim_day", return_value=True):
+            signin.submit_checkin(page, Mock(), config(self.root), signin.CheckFlow(self.log),
+                                  {"session_state": "signed_in"})
+        post_script, post_args = page.locator.return_value.evaluate.call_args.args
+
+        # Execute the actual browser callbacks with a fake DOM and fetch, using Playwright's bundled Node.
+        node, _ = compute_driver_executable()
+        result = subprocess.run([node, "-e", """
+            const assert = require('node:assert/strict');
+            const fs = require('node:fs');
+            const vm = require('node:vm');
+            const {pageScript, pageArgs, postScript, postArgs} = JSON.parse(fs.readFileSync(0, 'utf8'));
+            const field = (name, value, disabled = false, type = 'hidden') =>
+                ({name, value, type, matches: selector => selector === ':disabled' && disabled});
+            const currency = value => field('currency_ids[]', value);
+            const token = field('_xfToken', 'fixture-token');
+            const cases = [
+                ['one currency', [token, currency('one+1')], ['one+1']],
+                ['two currencies', [token, currency('1'), currency('2')], ['1', '2']],
+                ['three currencies', [token, currency('3'), currency('1'), currency('2')], ['3', '1', '2']],
+                ['missing currency', [token], null],
+                ['empty currency', [token, currency('1'), currency(' ')], null],
+                ['missing token', [currency('1')], null],
+                ['duplicate token', [token, token, currency('1')], null],
+            ];
+            (async () => {
+                for (const [label, inputs, expected] of cases) {
+                    const form = {action: postArgs.clock, method: 'post', enctype: 'application/x-www-form-urlencoded',
+                        elements: [...inputs, field('currency_ids[]', 'disabled', true),
+                            field('currency_ids[]', 'not-hidden', false, 'text'), field('unrelated', 'ignored')]};
+                    const requests = [];
+                    const scope = {URLSearchParams, AbortSignal, location: {href: pageArgs.home},
+                        document: {querySelector: () => null, querySelectorAll: selector =>
+                            selector === pageArgs.selector ? [form] : [{textContent: '今日尚未签到'}]},
+                        fetch: async (url, {method, body}) => {
+                            requests.push([url, method, [...body]]);
+                            return {status: 303};
+                        }};
+                    const check = vm.runInNewContext(pageScript, scope);
+                    const submit = vm.runInNewContext(postScript, scope);
+                    assert.equal(check(pageArgs), expected ? 'ready' : 'missing_fields', label);
+                    if (expected) {
+                        assert.equal(await submit(form, postArgs), 303, label);
+                        assert.deepEqual(requests, [[postArgs.clock, 'POST', [['_xfToken', token.value],
+                            ...expected.map(value => ['currency_ids[]', value])]]], label);
+                    } else {
+                        await assert.rejects(submit(form, postArgs), /The fields changed/, label);
+                        assert.deepEqual(requests, [], label);
+                    }
+                }
+            })().catch(error => { console.error(error); process.exitCode = 1; });
+        """], input=json.dumps({"pageScript": page_script, "pageArgs": page_args,
+                                "postScript": post_script, "postArgs": post_args}),
+            encoding="utf-8", capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_expected_redirect_verifies_once_and_cross_site_redirect_is_not_followed(self):
         for status, location, outcome in [(303, "/", "signed"), (307, "https://example.invalid/", "unexpected_post_response")]:
