@@ -4,7 +4,7 @@
 
 ## 下载安装
 
-从 [GitHub Releases](https://github.com/EternalmBlue/MbAutoSign/releases) 下载对应平台的压缩包。每个包都包含本平台的可执行文件、启动脚本、示例配置和第三方声明。无需另装 Python，可用发行页的 `SHA256SUMS` 校验压缩包。
+从 [GitHub Releases](https://github.com/EternalmBlue/MbAutoSign/releases) 下载对应平台的压缩包。每个包都包含本平台的可执行文件、启动脚本、`config.toml` 和第三方声明。无需另装 Python，可用发行页的 `SHA256SUMS` 校验压缩包。
 
 - **Windows x64**：解压 `MbAutoSign-windows-x64.zip`，进入解压目录。填写配置后，在 PowerShell 运行 `.\run-windows.ps1`，也可以直接运行 `MbAutoSign.exe`。若 PowerShell 因文件来自网络而拒绝运行，校验压缩包后可执行 `Unblock-File .\run-windows.ps1`。
 - **Linux x64 / ARM64**：用 `tar -xzf MbAutoSign-linux-x64.tar.gz`（ARM64 将文件名换成 `MbAutoSign-linux-arm64.tar.gz`）解压，然后进入同名目录。填写配置后运行 `./run-linux.sh`，也可以直接运行原生二进制 `./MbAutoSign`。
@@ -13,12 +13,12 @@ Linux 发行包以 Ubuntu 22.04 为构建基线。Cloak Browser 仍需要系统�
 
 ## 配置和运行
 
-在解压后、与可执行文件同一目录**手动创建** `config.toml`，参考 `config.example.toml` 填写。找不到配置时，程序会在终端和 `logs/checkins.jsonl` 提醒你创建并填写，然后退出。程序不会生成或修改配置文件。
+解压后直接编辑可执行文件旁的 `config.toml`。`[login]` 中的 `username` 和 `password` 默认留空，填写后可在登录会话失效时恢复登录。配置是明文，请勿分享。找不到配置时，程序会在终端和 `logs/checkins.jsonl` 提醒你创建并填写，然后退出。
 
+- `schedule.enable = true`（默认）：进程常驻，默认每天北京时间 `00:05` 执行，可通过 `schedule.time` 和 `schedule.timezone` 调整。启动时若已过当天设定时间，会执行当天尚未认领的任务。
 - `schedule.enable = false`：启动后尝试签到一次，完成或失败即退出。
-- `schedule.enable = true`：进程常驻，按 `schedule.time` 和 `schedule.timezone` 每日执行。启动时若已过当天设定时间，会执行当天尚未认领的任务。
 
-启动时无需任何参数。旧配置里的 `schedule.enabled` 仍可读取；建议改成 `schedule.enable`。在 `[login]` 填写 `username` 和 `password`，供登录会话失效时恢复。配置是明文，请勿分享。升级时保留 `config.toml`、专用浏览器配置、`.cloak-bin/` 和 `logs/`。
+启动时无需任何参数。旧配置里的 `schedule.enabled` 仍可读取；建议改成 `schedule.enable`。升级时请先备份并保留已有的 `config.toml`，避免被新版包中的空白配置覆盖；新默认值不会应用到旧配置。专用浏览器配置、`.cloak-bin/` 和 `logs/` 也请保留。
 
 程序先查项目缓存和本机 Cloak 默认安装缓存，只使用当前平台的固定版本。没有可用的本地版本时，先从 Cloak 官方源下载，失败时转试官方 GitHub 源，校验文件大小和固定 SHA-256 后安装到 `.cloak-bin/`。**发行包不包含 Cloak Browser**，首次且无缓存时需要联网。配置里的自定义可执行路径不会生效。
 
@@ -42,7 +42,7 @@ Linux 发行包以 Ubuntu 22.04 为构建基线。Cloak Browser 仍需要系统�
 
 ## 从源码运行
 
-需要 Python 3.11+。先手动创建和填写 `config.toml`，再运行：
+需要 Python 3.11+。如果项目根目录还没有 `config.toml`，先手动将 `packaging/config.toml` 复制到项目根目录，填写后再运行：
 
 ```sh
 python -m pip install -r requirements.txt

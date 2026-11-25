@@ -321,7 +321,7 @@ def main() -> int:
             config = load_settings()
         except FileNotFoundError:
             log.event("configuration_file_missing", level="error",
-                      action="请在程序所在目录创建 config.toml，参考 config.example.toml 填写登录和调度配置后重试。")
+                      action="请在程序所在目录创建并填写 config.toml，然后重试。")
             return 2
         log.tz = config.timezone
         if config.enabled and not scheduled:

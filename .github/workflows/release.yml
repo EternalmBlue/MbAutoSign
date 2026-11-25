@@ -81,7 +81,9 @@ jobs:
           - **Linux x64:** `MbAutoSign-linux-x64.tar.gz` includes the native `MbAutoSign` executable and `run-linux.sh`.
           - **Linux ARM64:** `MbAutoSign-linux-arm64.tar.gz` includes the native `MbAutoSign` executable and `run-linux.sh`.
 
-          Create `config.toml` next to the executable using `config.example.toml` as a reference. Python and its dependencies are included. Cloak Browser is downloaded from CloakHQ when no supported local copy is available.
+          Edit the included `config.toml` next to the executable. Login fields are blank, and the daily schedule defaults to 00:05 China Standard Time (`Asia/Shanghai`). If upgrading, keep your existing `config.toml` and update its schedule if desired.
+
+          Python and its dependencies are included. Cloak Browser is downloaded from CloakHQ when no supported local copy is available.
           NOTES
           gh release create "$RELEASE_TAG" ./* --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "MbAutoSign $RELEASE_TAG" \

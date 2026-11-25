@@ -1,6 +1,6 @@
 [schedule]
-enable = false # false: sign in once; true: keep running on the daily schedule.
-time = "09:00"
+enable = true # false: sign in once; true: keep running on the daily schedule.
+time = "00:05"
 timezone = "Asia/Shanghai"
 job_timeout_seconds = 600 # Total limit for each scheduled child process.
 retry_count = 2 # Additional attempts for known transient failures before a POST.

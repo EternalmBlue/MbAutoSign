@@ -98,8 +98,8 @@ class ReliabilityTests(unittest.TestCase):
 
     def test_old_executable_is_ignored_and_old_schedule_key_is_compatible(self):
         path = self.root / "config.toml"
-        example = (ROOT / "config.example.toml").read_text(encoding="utf-8")
-        path.write_text(example.replace("enable = false", "enabled = true").replace(
+        defaults = (ROOT / "packaging" / "config.toml").read_text(encoding="utf-8")
+        path.write_text(defaults.replace("enable = true", "enabled = true", 1).replace(
             "[browser]", '[browser]\nexecutable = "/untrusted/chrome"'), encoding="utf-8")
         cfg = load_settings(path)
         self.assertTrue(cfg.enabled)

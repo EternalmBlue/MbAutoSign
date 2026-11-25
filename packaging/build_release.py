@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import sysconfig
+import tomllib
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep
 
@@ -103,21 +104,30 @@ def smoke(command: list[str], root: Path, scratch: Path) -> None:
                     psutil.wait_procs(descendants, timeout=5)
 
     config = root / "config.toml"
-    rows = run(2)
-    assert rows[-1]["event"] == "configuration_file_missing" and "config.toml" in rows[-1]["action"]
-    assert not config.exists()
-    shutil.copyfile(ROOT / "config.example.toml", config)  # Test fixture only; the application never creates config.toml.
+    assert list(root.glob("*.toml")) == [config], "The archive must include only config.toml"
+    original = config.read_bytes()
+    text = original.decode("utf-8")
+    defaults = tomllib.loads(text)
+    if defaults.get("login") != {"username": "", "password": ""}:
+        raise RuntimeError("The release config must contain blank login credentials")
+    schedule = defaults["schedule"]
+    assert schedule["enable"] is True and schedule["time"] == "00:05" and schedule["timezone"] == "Asia/Shanghai"
     try:
+        config.unlink()
+        rows = run(2)
+        assert rows[-1]["event"] == "configuration_file_missing" and "config.toml" in rows[-1]["action"]
+        assert not config.exists()
+
+        config.write_text(text.replace("enable = true", "enable = false", 1), encoding="utf-8", newline="")
         rows = run(1)
         failures = [row["source"] for row in rows if row["event"] == "cloak_download_source_failed"]
         assert failures == ["official", "github"], rows
         assert rows[-1]["result"] == "cloak_unavailable" and rows[-1]["post_count"] == 0
         assert not list((root / ".cloak-bin").glob("*/.download-*"))
-        text = config.read_text(encoding="utf-8").replace("enable = false", "enable = true")
-        config.write_text(text.replace('time = "09:00"', 'time = "00:00"'), encoding="utf-8")
+        config.write_text(text.replace('time = "00:05"', 'time = "00:00"', 1), encoding="utf-8", newline="")
         verify_scheduler()
     finally:
-        config.unlink()
+        config.write_bytes(original)
 
 
 def build(output: Path) -> None:
@@ -147,7 +157,7 @@ def build(output: Path) -> None:
         shutil.copyfile(PACKAGING / launcher, package / launcher)
         if not windows:
             (package / launcher).chmod(0o755)
-        shutil.copyfile(ROOT / "config.example.toml", package / "config.example.toml")
+        shutil.copyfile(PACKAGING / "config.toml", package / "config.toml")
         write_notices(package / "THIRD-PARTY-NOTICES.txt")
 
         archive = Path(shutil.make_archive(str(package), "zip" if windows else "gztar",
