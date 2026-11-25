@@ -1,0 +1,16 @@
+[schedule]
+enabled = false
+time = "09:00"
+timezone = "Asia/Shanghai"
+job_timeout_seconds = 600 # Total limit for each scheduled child process.
+
+[browser]
+profile = ".cloak-profile"
+executable = "" # Empty: detect Cloak or download it to .cloak-bin/.
+headless = true
+timeout_ms = 20000
+challenge_wait_seconds = 10 # Passive wait in modes that restore login; 0 disables it.
+
+[login]
+username = ""
+password = ""

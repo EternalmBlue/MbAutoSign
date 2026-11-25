@@ -1,0 +1,166 @@
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from threading import Event
+from time import monotonic
+from uuid import uuid4
+
+import psutil
+from filelock import FileLock, Timeout
+
+from .runlog import RunLog
+from .settings import LOG_DIR, ROOT, Settings
+
+
+RUN_ID_ENV = "MBAUTOSIGN_JOB_ID"
+POLL_SECONDS = 15
+
+
+def claim_day(directory: Path, day: str) -> bool:
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        # The marker itself is sufficient; never remove it after an ambiguous failure.
+        with (directory / f"{day}.lock").open("xb"):
+            pass
+    except FileExistsError:
+        return False
+    return True
+
+
+def stop_worker(worker: subprocess.Popen, log: RunLog, job_id: str) -> None:
+    descendants = []
+    cleanup_failed = False
+    try:
+        # Chromium/Playwright may start a new process group, so also track descendants.
+        descendants = psutil.Process(worker.pid).children(recursive=True)
+    except psutil.NoSuchProcess:
+        pass
+    except psutil.Error as exc:
+        cleanup_failed = True
+        log.exception("worker_tree_inspection_failed", exc, job_id=job_id)
+
+    if os.name != "nt":
+        try:
+            os.killpg(worker.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            cleanup_failed = True
+            log.exception("worker_group_stop_failed", exc, job_id=job_id)
+    try:
+        worker.kill()
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        cleanup_failed = True
+        log.exception("worker_stop_failed", exc, job_id=job_id)
+
+    for child in reversed(descendants):
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.Error as exc:
+            cleanup_failed = True
+            log.exception("worker_descendant_stop_failed", exc, job_id=job_id)
+    try:
+        worker.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        cleanup_failed = True
+        log.exception("worker_reap_failed", exc, job_id=job_id)
+    try:
+        _, remaining = psutil.wait_procs(descendants, timeout=1)
+        active = sum(child.status() not in {psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD} for child in remaining if child.is_running())
+    except psutil.NoSuchProcess:
+        active = 0
+    except psutil.Error as exc:
+        active = 0
+        cleanup_failed = True
+        log.exception("worker_descendant_verify_failed", exc, job_id=job_id)
+    cleanup_failed |= active > 0
+    log.event("worker_cleanup", level="warning" if cleanup_failed else "info", job_id=job_id,
+              descendants=len(descendants), still_active=active, cleanup_failed=cleanup_failed)
+
+
+def run_worker(config: Settings, log: RunLog, stopping: Event, day: str, *,
+               command: list[str] | None = None) -> None:
+    job_id = uuid4().hex
+    env = {**os.environ, RUN_ID_ENV: job_id, "PYTHONUNBUFFERED": "1"}
+    flags = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+    if command is None:
+        command = [sys.executable, "-X", "utf8", str(ROOT / "signin.py"), "--submit"]
+    log.event("worker_starting", job_id=job_id, day=day, timeout_seconds=config.job_timeout_seconds)
+    started = monotonic()
+    worker = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL, env=env, **flags)
+    try:
+        deadline = started + config.job_timeout_seconds
+        while True:
+            if (code := worker.poll()) is not None:
+                log.event("worker_finished", level="info" if code == 0 else "warning", job_id=job_id, day=day,
+                          exit_code=code, job_elapsed_ms=int((monotonic() - started) * 1000))
+                return
+            remaining = deadline - monotonic()
+            if remaining <= 0 or stopping.is_set():
+                log.event("worker_cancelled" if stopping.is_set() else "worker_timeout", level="warning",
+                          job_id=job_id, day=day, job_elapsed_ms=int((monotonic() - started) * 1000))
+                return
+            stopping.wait(min(remaining, 0.25))
+    finally:
+        if worker.poll() is None:
+            stop_worker(worker, log, job_id)
+
+
+def daily_loop(config: Settings, log: RunLog, stopping: Event, *, now=None, worker=None,
+               claims: Path = LOG_DIR / "schedule") -> None:
+    now = now or (lambda: datetime.now(config.timezone))
+    worker = worker or run_worker
+    last_day = None
+    while not stopping.is_set():
+        try:
+            current = now()
+            day = current.date().isoformat()
+            if day != last_day and current.time() >= config.scheduled_time:
+                allowed = claim_day(claims, day)
+                last_day = day
+                if allowed:
+                    log.event("schedule_due", day=day)
+                    worker(config, log, stopping, day)
+                else:
+                    log.event("schedule_day_already_claimed", day=day)
+        except Exception as exc:
+            log.exception("schedule_iteration_failed", exc)
+        stopping.wait(POLL_SECONDS)
+
+
+def watch(config: Settings) -> int:
+    log = RunLog("watch", config.timezone)
+    if not config.enabled:
+        log.event("schedule_disabled")
+        return 0
+    stopping = Event()
+    signals = (signal.SIGINT, signal.SIGTERM)
+    previous = {sig: signal.signal(sig, lambda *_: stopping.set()) for sig in signals}
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with FileLock(LOG_DIR / "watch.lock", timeout=0):
+            log.event("schedule_started", local_time=config.scheduled_time.strftime("%H:%M"),
+                      timezone=config.timezone.key, timeout_seconds=config.job_timeout_seconds)
+            try:
+                daily_loop(config, log, stopping)
+            finally:
+                log.event("schedule_stopped")
+    except Timeout:
+        log.event("schedule_already_running", level="warning")
+        return 1
+    except Exception as exc:
+        log.exception("schedule_start_failed", exc)
+        return 1
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return 0
